@@ -8,6 +8,6 @@
 
 Инструкция:
 ```
-git clone https://github.com/yutkin/lenta.ru-news-dataset && cd data
+git clone https://github.com/yutkin/lenta.ru-news-dataset && cd lenta.ru-news-dataset/data/
 cat lenta_data.tar.gz.* | tar xzv -C <путь распаковки>
 ```
