@@ -1,92 +1,132 @@
-import csv
-import requests
-from multiprocessing import Process, Queue, Value, Lock, current_process
-import queue
-from datetime import datetime, timedelta
-import signal
+import asyncio
 import logging
-import time
-import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from itertools import islice
+from multiprocessing import cpu_count
 
+import aiohttp
+import pandas as pd
 from bs4 import BeautifulSoup
 
-NUM_JOBS = 128
+logger = logging.getLogger(name="LentaParser")
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s @ %(message)s",
+    datefmt="%d-%m-%Y %H:%M:%S",
+)
 
-def url_fetcher(Q, sync_flag):
-    curr_date = datetime.now()
-    url_counter = 0
-    while True:
-        url_to_fetch = 'https://lenta.ru/news/' + curr_date.strftime('%Y/%m/%d')
-        try:
-            response = requests.get(url_to_fetch)
-            if response.status_code != requests.codes.ok:
-                raise Exception()
-        except Exception:
-            sync_flag.value = 0
-            break
 
-        html_tree = BeautifulSoup(response.text, 'lxml')
-        news_list = html_tree.find_all('div', 'item news b-tabloid__topic_news')
-        for news in news_list:
-            news_url = 'https://lenta.ru' + news.find('a')['href']
-            Q.put(news_url)
+class LentaParser:
+    def __init__(
+            self, max_workers=cpu_count(), max_async_tasks=25, outfile_name="news_lenta.csv"
+    ):
+        self.queue = asyncio.Queue()
+        self._endpoint = "https://lenta.ru/news"
+        self._sess = None
+        self.loop = asyncio.get_event_loop()
+        self.dates_countdown = self.dates_countdown()
+        self.max_async_tasks = max_async_tasks
+        self.max_workers = max_workers
+        self.outfile_name = outfile_name
+        self.news_fetched = []
 
-            url_counter += 1
-            if url_counter % 1000 == 0:
-                logging.debug('total downloaded %d urls' % url_counter)
-        curr_date -= timedelta(1)
-
-def fetch_news(Q, sync_flag):
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    news_storage = []
-    pid = current_process().pid
-
-    while sync_flag.value == 1:
-        try:
-            url = Q.get_nowait()
-        except queue.Empty:
-            continue
-
-        response = requests.get(url)
-        if response.status_code == requests.codes.ok:
-            html = BeautifulSoup(response.text, 'lxml')
-            tags = html.find('a', 'item dark active')
-            tags = tags.get_text() if tags else None
+    def dates_countdown(self):
+        date = datetime(year=2000, day=1, month=1)
+        # date = datetime.today()
+        while True:
+            yield date.strftime("%Y/%m/%d")
             try:
-                paragraphs = html.find('div', attrs={"itemprop":"articleBody"}).find_all('p')
-                text = ' '.join([p.get_text() for p in paragraphs])
-                topic = html.find('a', 'b-header-inner__block').get_text()
-                title = html.find('h1', attrs={"itemprop": "headline"}).get_text()
-            except Exception:
-                continue
-            news_storage.append({'title': title, 'url': url, 'text': text,
-                                 'topic': topic, 'tags': tags})
-            logging.debug('%s' % url)
+                date -= timedelta(days=1)
+            except OverflowError:
+                return
 
-    logging.debug('Stopped, writing to news_lenta_%d.csv' % pid)
-    pd.DataFrame(news_storage).to_csv('news_lenta_%d.csv' % pid, encoding='utf-8', index=None)
+    @property
+    def session(self):
+        if self._sess is None or self._sess.closed:
+            self._sess = aiohttp.ClientSession()
+        return self._sess
+
+    async def fetch(self, url):
+        response = await self.session.get(url, allow_redirects=False)
+
+        logger.debug(f"{url} ({response.status})")
+
+        text = None
+        if response.status == 200:
+            text = await response.text()
+        return text
+
+    @staticmethod
+    def parse_article_html(html):
+        doc_tree = BeautifulSoup(html, "lxml")
+        tags = doc_tree.find("a", "item dark active")
+        tags = tags.get_text() if tags else None
+        paragraphs = doc_tree.find("div", attrs={"itemprop": "articleBody"}).find_all(
+            "p"
+        )
+        text = " ".join([p.get_text() for p in paragraphs])
+        topic = doc_tree.find("a", "b-header-inner__block").get_text()
+        title = doc_tree.find("h1", attrs={"itemprop": "headline"}).get_text()
+
+        return {"title": title, "text": text, "topic": topic, "tags": tags}
+
+    async def fetch_all_news_on_page(self, feth_news_page_coro):
+        html = await feth_news_page_coro
+        if html:
+            doc_tree = BeautifulSoup(html, "lxml")
+            news_list = doc_tree.find_all("div", "item news b-tabloid__topic_news")
+            news_urls = [
+                f"https://lenta.ru{news.find('a')['href']}" for news in news_list
+            ]
+
+            tasks = (asyncio.ensure_future(self.fetch(url)) for url in news_urls)
+
+            fetched_news_html = await asyncio.gather(*tasks)
+
+            with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = []
+                for article_html in fetched_news_html:
+                    futures.append(
+                        executor.submit(self.parse_article_html, article_html)
+                    )
+
+                for article_url, future in zip(news_urls, as_completed(futures)):
+                    try:
+                        processed_artile = future.result()
+                        processed_artile["url"] = article_url
+                        self.news_fetched.append(processed_artile)
+
+                    except Exception:
+                        logger.exception(f"Error while processing {article_url}")
+
+    async def producer(self):
+        for date in islice(self.dates_countdown, self.max_async_tasks):
+            news_page_url = f"{self._endpoint}/{date}"
+            fut = asyncio.ensure_future(self.fetch(news_page_url))
+            await self.fetch_all_news_on_page(fut)
+
+    def run(self):
+        try:
+            self.loop.run_until_complete(self.producer())
+        except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt, exiting...")
+        finally:
+            if self._sess:
+                self.loop.run_until_complete(self._sess.close())
+            self.loop.stop()
+            if self.news_fetched:
+                logger.info(f"{len(self.news_fetched)} news total processed. "
+                            f"Writing to {self.outfile_name}...")
+                pd.DataFrame(self.news_fetched).to_csv(
+                    self.outfile_name, encoding="utf-8", index=None
+                )
+
 
 def main():
-    logging.basicConfig(level=logging.DEBUG,
-                        format='[PID %(process)d %(asctime)s] %(message)s',
-                        datefmt='%d/%m/%Y %H:%M:%S')
-    logging.getLogger('requests').setLevel(logging.CRITICAL)
+    parser = LentaParser()
+    parser.run()
 
-    Q = Queue()
-    sync_flag = Value('i', 1)
 
-    workers = []
-    for _ in range(NUM_JOBS):
-        workers.append(Process(target=fetch_news, args=(Q, sync_flag)))
-        workers[-1].start()
-
-    try:
-        url_fetcher(Q, sync_flag)
-    except KeyboardInterrupt:
-        sync_flag.value = 0
-    finally:
-        for worker in workers:
-            worker.join()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
