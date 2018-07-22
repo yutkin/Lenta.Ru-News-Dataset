@@ -63,6 +63,8 @@ class LentaParser:
     text = None
     if response.status == 200:
       text = await response.text()
+    else:
+      logger.warning(f"Cannot fetch {url}")
     return text
 
   @staticmethod
@@ -107,6 +109,10 @@ class LentaParser:
         task.url = url
         tasks.append(task)
 
+      if not tasks:
+        logger.warning(f"There no articles at {feth_news_page_coro.url}")
+        return True  # If no any task, try to fetch new one
+
       done, _ = await asyncio.wait(tasks)
 
       with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
@@ -131,7 +137,8 @@ class LentaParser:
   async def producer(self):
     for date in self.dates_countdown:
       news_page_url = f"{self._endpoint}/{date}"
-      fut = asyncio.ensure_future(self.fetch(news_page_url))
+      fut = asyncio.Task(self.fetch(news_page_url))
+      fut.url = news_page_url
       ok = await self.fetch_all_news_on_page(fut)
       if not ok:
         break
