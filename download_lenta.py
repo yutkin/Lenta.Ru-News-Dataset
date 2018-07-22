@@ -9,6 +9,7 @@ import aiohttp
 import uvloop
 from bs4 import BeautifulSoup
 import csv
+
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(name="LentaParser")
@@ -32,7 +33,7 @@ class LentaParser:
       unixtime = int(time.time())
       self.outfile_name = f"news_lenta_{unixtime}.csv"
 
-    self.outfile = open(self.outfile_name, "a")
+    self.outfile = open(self.outfile_name, "w", 1)
     self.csv_writer = csv.DictWriter(
         self.outfile, fieldnames=["url", "title", "text", "topic", "tags"])
     self.csv_writer.writeheader()
@@ -65,14 +66,15 @@ class LentaParser:
     return text
 
   @staticmethod
-  def parse_article_html(html):
+  def parse_article_html(html, url):
     doc_tree = BeautifulSoup(html, "lxml")
     tags = doc_tree.find("a", "item dark active")
     tags = tags.get_text() if tags else None
 
     body = doc_tree.find("div", attrs={"itemprop": "articleBody"})
     if not body:
-      raise RuntimeError("Could not find div with itemprop=articleBody")
+      raise RuntimeError(
+          f"Could not find div with itemprop=articleBody in {url}")
 
     text = " ".join([p.get_text() for p in body.find_all("p")])
 
@@ -82,7 +84,13 @@ class LentaParser:
     title = doc_tree.find("h1", attrs={"itemprop": "headline"})
     title = title.get_text() if title else None
 
-    return {"title": title, "text": text, "topic": topic, "tags": tags}
+    return {
+        "title": title,
+        "text": text,
+        "topic": topic,
+        "tags": tags,
+        "url": url
+    }
 
   async def fetch_all_news_on_page(self, feth_news_page_coro):
     html = await feth_news_page_coro
@@ -93,24 +101,30 @@ class LentaParser:
           f"https://lenta.ru{news.find('a')['href']}" for news in news_list
       ]
 
-      tasks = (asyncio.ensure_future(self.fetch(url)) for url in news_urls)
+      tasks = []
+      for url in news_urls:
+        task = asyncio.Task(self.fetch(url))
+        task.url = url
+        tasks.append(task)
 
-      fetched_news_html = await asyncio.gather(*tasks)
+      done, _ = await asyncio.wait(tasks)
 
       with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
         futures = []
-        for article_html in fetched_news_html:
-          futures.append(executor.submit(self.parse_article_html, article_html))
+        for article_html, article_url in ((feat.result(), feat.url)
+                                          for feat in done):
+          futures.append(
+              executor.submit(self.parse_article_html, article_html,
+                              article_url))
 
-      for article_url, future in zip(news_urls, as_completed(futures)):
+      for fut in as_completed(futures):
         try:
-          processed_artile = future.result()
-          processed_artile["url"] = article_url
+          processed_artile = fut.result()
           self.csv_writer.writerow(processed_artile)
           self.n_downloaded += 1
 
         except Exception:
-          logger.exception(f"Error while processing {article_url}")
+          logger.exception("Cannot parse...")
       logger.info(f"#{self.n_downloaded} news processed.")
     return html is not None
 
