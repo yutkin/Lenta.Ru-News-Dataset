@@ -16,7 +16,7 @@
 
 ## Скачать / Download
 * [Kaggle](https://www.kaggle.com/yutkin/corpus-of-russian-news-articles-from-lenta/)
-* [GitHub](https://github.com/yutkin/Lenta.Ru-News-Dataset/releases/download/0.1/news_lenta.csv)
+* [GitHub](https://github.com/yutkin/Lenta.Ru-News-Dataset/releases/download/0.2/news_lenta.csv.bz2)
 * [Amazon S3](https://s3-us-west-2.amazonaws.com/lenta-news-dataset/news_lenta.csv.bz2)
 
 ## Распаковка / Decompression
