@@ -3,7 +3,7 @@
 * News articles: ~700.000
 * Dates: 08.1999 -- 07.2018
 
-+ [Script](../master/download_lenta.py) for news downloading (Python 3.6+ is required).
++ [Script](../master/download_lenta.py) for news downloading (Python 3.7+ is required).
 
 
 ## Download
