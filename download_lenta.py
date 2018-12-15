@@ -1,15 +1,13 @@
+import argparse
 import asyncio
+import csv
 import logging
-import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from multiprocessing import cpu_count
-import argparse
 
 import aiohttp
 from bs4 import BeautifulSoup
-import csv
-
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -20,6 +18,10 @@ logger = logging.getLogger(name="LentaParser")
 
 
 class LentaParser:
+
+    # lxml is much faster but error prone
+    default_parser = "html.parser"
+
     def __init__(self, *, max_workers: int, outfile_name: str):
         self._endpoint = "https://lenta.ru/news"
 
@@ -38,13 +40,11 @@ class LentaParser:
 
     @property
     def dates_countdown(self):
-        date = datetime.today()
-        while True:
-            yield date.strftime("%Y/%m/%d")
-            try:
-                date -= timedelta(days=1)
-            except OverflowError:
-                return
+        date_start, date_end = datetime.today(), datetime(1999, 8, 30)
+
+        while date_start > date_end:
+            yield date_start.strftime("%Y/%m/%d")
+            date_start -= timedelta(days=1)
 
     @property
     def writer(self):
@@ -76,19 +76,18 @@ class LentaParser:
     async def fetch(self, url: str):
         response = await self.session.get(url, allow_redirects=False)
         response.raise_for_status()
-        text = await response.text(encoding="utf-8")
-        return text
+        return await response.text(encoding="utf-8")
 
     @staticmethod
     def parse_article_html(html: str):
-        doc_tree = BeautifulSoup(html, "lxml")
+        doc_tree = BeautifulSoup(html, LentaParser.default_parser)
         tags = doc_tree.find("a", "item dark active")
         tags = tags.get_text() if tags else None
 
         body = doc_tree.find("div", attrs={"itemprop": "articleBody"})
 
         if not body:
-            raise RuntimeError(f"Could not find div with itemprop=articleBody")
+            raise RuntimeError(f"Article body is not found")
 
         text = " ".join([p.get_text() for p in body.find_all("p")])
 
@@ -101,65 +100,53 @@ class LentaParser:
         return {"title": title, "text": text, "topic": topic, "tags": tags}
 
     @staticmethod
-    def _extract_news_urls_from_raw_html(html: str):
-        doc_tree = BeautifulSoup(html, "lxml")
+    def _extract_urls_from_html(html: str):
+        doc_tree = BeautifulSoup(html, LentaParser.default_parser)
         news_list = doc_tree.find_all("div", "item news b-tabloid__topic_news")
-        news_urls = [f"https://lenta.ru{news.find('a')['href']}" for news in news_list]
-        return news_urls
+        return [f"https://lenta.ru{news.find('a')['href']}" for news in news_list]
 
     async def _fetch_all_news_on_page(self, html: str):
         loop = asyncio.get_running_loop()
 
         # Get news URLs from raw html
         news_urls = await loop.run_in_executor(
-            self._executor, self._extract_news_urls_from_raw_html, html
+            self._executor, self._extract_urls_from_html, html
         )
 
         # Fetching news
-        tasks = []
-        for url in news_urls:
-            tasks.append(asyncio.create_task(self.fetch(url)))
+        tasks = [asyncio.create_task(self.fetch(url)) for url in news_urls]
 
-        fetched_raw_news = []
+        fetched_raw_news = dict()
 
         for i, task in enumerate(tasks):
             try:
-                res = await task
-            except Exception as exc:
-                logger.error(f"Cannot fetch {news_urls[i]}: {exc}")
-                news_urls.pop(i)
+                fetch_res = await task
+            except aiohttp.ClientResponseError as exc:
+                logger.error(f"Cannot fetch {exc.request_info.url}: {exc}")
             else:
-                fetched_raw_news.append(res)
+                fetched_raw_news[news_urls[i]] = fetch_res
 
-        tasks.clear()
-
-        for raw_news in fetched_raw_news:
-            tasks.append(
-                loop.run_in_executor(self._executor, self.parse_article_html, raw_news)
+        for url, html in fetched_raw_news.items():
+            fetched_raw_news[url] = loop.run_in_executor(
+                self._executor, self.parse_article_html, html
             )
 
         parsed_news = []
 
-        for i, task in enumerate(tasks):
+        for url, task in fetched_raw_news.items():
             try:
-                res = await task
+                parse_res = await task
             except Exception as exc:
-                logger.error(f"Error while parse {news_urls[i]}: {exc}")
-                news_urls.pop(i)
+                logger.error(f"Cannot parse {url}: {exc}")
             else:
-                parsed_news.append(res)
+                parse_res["url"] = url
+                parsed_news.append(parse_res)
 
-        n_futures = 0
-
-        for i, news in enumerate(parsed_news):
-            news["url"] = news_urls[i]
-            n_futures += 1
-
-        if n_futures > 0:
+        if parsed_news:
             self.writer.writerows(parsed_news)
-            self._n_downloaded += n_futures
+            self._n_downloaded += len(parsed_news)
 
-        return n_futures
+        return len(parsed_news)
 
     async def _shutdown(self):
         if self._sess is not None:
@@ -181,13 +168,12 @@ class LentaParser:
             try:
                 html = await asyncio.create_task(self.fetch(news_page_url))
             except aiohttp.ClientResponseError as exc:
-                logger.error(f"Cannot fetch {news_page_url} [{exc.status}]")
+                logger.error(f"Cannot fetch {exc.request_info.url} [{exc.status}]")
             else:
                 n_proccessed_news = await self._fetch_all_news_on_page(html)
 
                 if n_proccessed_news == 0:
-                    logger.info(f"News not found on {news_page_url}. Stopping...")
-                    return
+                    logger.info(f"News not found on {news_page_url}.")
 
                 logger.info(
                     f"{news_page_url} processed ({n_proccessed_news} news). "
