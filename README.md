@@ -8,6 +8,7 @@
 
 ## Download
 * [GitHub](https://github.com/yutkin/Lenta.Ru-News-Dataset/releases/tag/v1.0)
+* [Kaggle](https://www.kaggle.com/yutkin/corpus-of-russian-news-articles-from-lenta/)
 
 ## Decompression
 `gzip -d lenta-ru-news.csv.gz`
