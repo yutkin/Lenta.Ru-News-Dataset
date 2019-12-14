@@ -22,29 +22,29 @@ class LentaParser:
     # lxml is much faster but error prone
     default_parser = "html.parser"
 
-    def __init__(self, *, max_workers: int, outfile_name: str):
+    def __init__(self, *, max_workers: int, outfile_name: str, from_date: str):
         self._endpoint = "https://lenta.ru/news"
 
         self._sess = None
         self._connector = None
-        self._read_timeout = 10
-        self._conn_timeout = 10
 
         self._executor = ProcessPoolExecutor(max_workers=max_workers)
 
         self._outfile_name = outfile_name
         self._outfile = None
         self._csv_writer = None
+        self.timeouts = aiohttp.ClientTimeout(total=60, connect=60)
 
         self._n_downloaded = 0
+        self._from_date = datetime.strptime(from_date, "%d.%m.%Y")
 
     @property
     def dates_countdown(self):
-        date_start, date_end = datetime.today(), datetime(1999, 8, 30)
+        date_start, date_end = self._from_date, datetime.today()
 
-        while date_start > date_end:
+        while date_start <= date_end:
             yield date_start.strftime("%Y/%m/%d")
-            date_start -= timedelta(days=1)
+            date_start += timedelta(days=1)
 
     @property
     def writer(self):
@@ -62,13 +62,10 @@ class LentaParser:
         if self._sess is None or self._sess.closed:
 
             self._connector = aiohttp.TCPConnector(
-                use_dns_cache=True, ttl_dns_cache=60 * 60, limit=512
+                use_dns_cache=True, ttl_dns_cache=60 * 60, limit=1024
             )
-
             self._sess = aiohttp.ClientSession(
-                connector=self._connector,
-                read_timeout=self._read_timeout,
-                conn_timeout=self._conn_timeout,
+                connector=self._connector, timeout=self.timeouts
             )
 
         return self._sess
@@ -103,18 +100,17 @@ class LentaParser:
     def _extract_urls_from_html(html: str):
         doc_tree = BeautifulSoup(html, LentaParser.default_parser)
         news_list = doc_tree.find_all("div", "item news b-tabloid__topic_news")
-        return [f"https://lenta.ru{news.find('a')['href']}" for news in news_list]
+        return tuple(f"https://lenta.ru{news.find('a')['href']}" for news in news_list)
 
     async def _fetch_all_news_on_page(self, html: str):
-        loop = asyncio.get_running_loop()
-
         # Get news URLs from raw html
+        loop = asyncio.get_running_loop()
         news_urls = await loop.run_in_executor(
             self._executor, self._extract_urls_from_html, html
         )
 
         # Fetching news
-        tasks = [asyncio.create_task(self.fetch(url)) for url in news_urls]
+        tasks = tuple(asyncio.create_task(self.fetch(url)) for url in news_urls)
 
         fetched_raw_news = dict()
 
@@ -123,6 +119,8 @@ class LentaParser:
                 fetch_res = await task
             except aiohttp.ClientResponseError as exc:
                 logger.error(f"Cannot fetch {exc.request_info.url}: {exc}")
+            except asyncio.TimeoutError:
+                logger.exception("Cannot fetch. Timout")
             else:
                 fetched_raw_news[news_urls[i]] = fetch_res
 
@@ -136,8 +134,8 @@ class LentaParser:
         for url, task in fetched_raw_news.items():
             try:
                 parse_res = await task
-            except Exception as exc:
-                logger.error(f"Cannot parse {url}: {exc}")
+            except Exception:
+                logger.exception(f"Cannot parse {url}")
             else:
                 parse_res["url"] = url
                 parsed_news.append(parse_res)
@@ -148,11 +146,11 @@ class LentaParser:
 
         return len(parsed_news)
 
-    async def _shutdown(self):
+    async def shutdown(self):
         if self._sess is not None:
             await self._sess.close()
 
-        await asyncio.sleep(0.250)
+        await asyncio.sleep(0.5)
 
         if self._outfile is not None:
             self._outfile.close()
@@ -167,13 +165,15 @@ class LentaParser:
 
             try:
                 html = await asyncio.create_task(self.fetch(news_page_url))
-            except aiohttp.ClientResponseError as exc:
-                logger.error(f"Cannot fetch {exc.request_info.url} [{exc.status}]")
+            except aiohttp.ClientResponseError:
+                logger.exception(f"Cannot fetch {news_page_url}")
+            except aiohttp.ClientConnectionError:
+                logger.exception(f"Cannot fetch {news_page_url}")
             else:
                 n_proccessed_news = await self._fetch_all_news_on_page(html)
 
                 if n_proccessed_news == 0:
-                    logger.info(f"News not found on {news_page_url}.")
+                    logger.info(f"News not found at {news_page_url}.")
 
                 logger.info(
                     f"{news_page_url} processed ({n_proccessed_news} news). "
@@ -184,7 +184,7 @@ class LentaParser:
         try:
             await self._producer()
         finally:
-            await self._shutdown()
+            await self.shutdown()
 
 
 def main():
@@ -195,16 +195,28 @@ def main():
     )
 
     parser.add_argument(
-        "--cpu-workers", default=cpu_count(), type=int, help="number of cpu workers"
+        "--cpu-workers", default=cpu_count(), type=int, help="number of workers"
+    )
+
+    parser.add_argument(
+        "--from-date",
+        default="30.08.1999",
+        type=str,
+        help="download news from this date. Example: 30.08.1999",
     )
 
     args = parser.parse_args()
 
+    parser = LentaParser(
+        max_workers=args.cpu_workers,
+        outfile_name=args.outfile,
+        from_date=args.from_date,
+    )
+
     try:
-        asyncio.run(
-            LentaParser(max_workers=args.cpu_workers, outfile_name=args.outfile).run()
-        )
+        asyncio.run(parser.run())
     except KeyboardInterrupt:
+        asyncio.run(parser.shutdown())
         logger.info("KeyboardInterrupt, exiting...")
 
 
