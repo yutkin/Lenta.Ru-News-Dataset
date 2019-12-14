@@ -1,2 +1,2 @@
-aiohttp==3.4.4
+aiohttp==3.6.2
 beautifulsoup4==4.6.3
