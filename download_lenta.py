@@ -3,9 +3,11 @@ import asyncio
 import csv
 import logging
 import os
+import sys
 import typing
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
+from distutils.util import strtobool
 from itertools import chain
 from multiprocessing import cpu_count
 from urllib.parse import urljoin
@@ -29,6 +31,17 @@ class LentaParser:
     def __init__(self, *, max_workers: int, outfile_name: str, from_date: str):
         self._endpoint = "https://lenta.ru/"
 
+        self._ignored_news_prefixes = (
+            "https://lenta.ru/extlink/",
+            "/extlink/",
+            "/sport/",
+            "/themes/",
+            "/tags/",
+        )
+
+        self._csv_date_format = "%Y/%m/%d"
+        self._csv_fields = ["date", "url", "topic", "tags", "title", "text"]
+
         self._sess = None
         self._connector = None
 
@@ -41,22 +54,32 @@ class LentaParser:
         self.timeouts = aiohttp.ClientTimeout(total=60, connect=60)
 
         self._existing_urls = set()
+        self._latest_parsed_date = None
         if self._is_outfile_exists:
+            latest_parsed_date = None
             with open(self._outfile_name, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
+                    latest_parsed_date = row["date"]
                     self._existing_urls.add(row["url"])
+            if latest_parsed_date:
+                try:
+                    self._latest_parsed_date = datetime.strptime(latest_parsed_date, self._csv_date_format)
+                except (ValueError, TypeError):
+                    pass
 
         self._n_downloaded = len(self._existing_urls)
-        self._from_date = datetime.strptime(from_date, "%d.%m.%Y")
+        self._argument_date_format = "%d.%m.%Y"
+        self._from_date = datetime.strptime(from_date, self._argument_date_format)
 
-        self._ignored_news_prefixes = (
-            "https://lenta.ru/extlink/",
-            "/extlink/",
-            "/sport/",
-            "/themes/",
-            "/tags/",
-        )
+    def get_latest_parsed_date(self) -> typing.Optional[str]:
+        if self._latest_parsed_date and self._latest_parsed_date > self._from_date:
+            return self._latest_parsed_date.strftime(self._argument_date_format)
+
+    def forward_to_latest_parsed_date(self):
+        if self._latest_parsed_date:
+            self._from_date = self._latest_parsed_date
+            logger.info(f"Start parsing from {self._from_date.strftime(self._argument_date_format)}")
 
     @property
     def dates_countdown(self):
@@ -72,7 +95,7 @@ class LentaParser:
             mode = "a" if self._is_outfile_exists else "w"
             self._outfile = open(self._outfile_name, mode=mode, buffering=1, encoding="utf-8")
             self._csv_writer = csv.DictWriter(
-                self._outfile, fieldnames=["date", "url", "topic", "tags", "title", "text"]
+                self._outfile, fieldnames=self._csv_fields
             )
             if not self._is_outfile_exists:
                 self._csv_writer.writeheader()
@@ -177,7 +200,7 @@ class LentaParser:
             else:
                 if url not in self._existing_urls:
                     parse_res["url"] = url
-                    parse_res["date"] = date.strftime("%Y/%m/%d")
+                    parse_res["date"] = date.strftime(self._csv_date_format)
                     parsed_news.append(parse_res)
 
         if parsed_news:
@@ -255,6 +278,15 @@ def main():
         outfile_name=args.outfile,
         from_date=args.from_date,
     )
+
+    latest_from_date = parser.get_latest_parsed_date()
+    if latest_from_date:
+        sys.stdout.write(
+            f'The latest parsed date in the {args.outfile} file is {latest_from_date}. '
+            'Continue from this date [y/n]? '
+        )
+        if strtobool(input().lower()):
+            parser.forward_to_latest_parsed_date()
 
     try:
         asyncio.run(parser.run())
